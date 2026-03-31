@@ -16,8 +16,10 @@ import { FALLBACK_ERROR_PATTERNS } from '../../../src/services/worker/agents/typ
 
 describe('FallbackErrorHandler', () => {
   describe('FALLBACK_ERROR_PATTERNS', () => {
-    it('should contain all 7 expected patterns', () => {
-      expect(FALLBACK_ERROR_PATTERNS).toHaveLength(7);
+    it('should contain all 9 expected patterns', () => {
+      expect(FALLBACK_ERROR_PATTERNS).toHaveLength(9);
+      expect(FALLBACK_ERROR_PATTERNS).toContain('401');
+      expect(FALLBACK_ERROR_PATTERNS).toContain('402');
       expect(FALLBACK_ERROR_PATTERNS).toContain('429');
       expect(FALLBACK_ERROR_PATTERNS).toContain('500');
       expect(FALLBACK_ERROR_PATTERNS).toContain('502');
@@ -72,8 +74,12 @@ describe('FallbackErrorHandler', () => {
         expect(shouldFallbackToClaude(new Error('400 Invalid argument'))).toBe(false);
       });
 
-      it('should return false for 401 Unauthorized', () => {
-        expect(shouldFallbackToClaude('401 Unauthorized')).toBe(false);
+      it('should return true for 401 Unauthorized (expired key)', () => {
+        expect(shouldFallbackToClaude('401 Unauthorized')).toBe(true);
+      });
+
+      it('should return true for 402 Payment Required', () => {
+        expect(shouldFallbackToClaude('402 Payment Required')).toBe(true);
       });
 
       it('should return false for 403 Forbidden', () => {

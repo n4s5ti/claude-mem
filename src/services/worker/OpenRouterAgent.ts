@@ -182,28 +182,30 @@ export class OpenRouterAgent {
           session.conversationHistory.push({ role: 'user', content: obsPrompt });
           const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
 
-          let tokensUsed = 0;
           if (obsResponse.content) {
-            // Add response to conversation history
-            // session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
-
-            tokensUsed = obsResponse.tokensUsed || 0;
+            const tokensUsed = obsResponse.tokensUsed || 0;
             session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
             session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-          }
 
-          // Process response using shared ResponseProcessor
-          await processAgentResponse(
-            obsResponse.content || '',
-            session,
-            this.dbManager,
-            this.sessionManager,
-            worker,
-            tokensUsed,
-            originalTimestamp,
-            'OpenRouter',
-            lastCwd
-          );
+            // Process response using shared ResponseProcessor
+            await processAgentResponse(
+              obsResponse.content,
+              session,
+              this.dbManager,
+              this.sessionManager,
+              worker,
+              tokensUsed,
+              originalTimestamp,
+              'OpenRouter',
+              lastCwd
+            );
+          } else {
+            logger.warn('SDK', 'Empty OpenRouter observation response, skipping processing to preserve message', {
+              sessionId: session.sessionDbId,
+              messageId: session.processingMessageIds[session.processingMessageIds.length - 1]
+            });
+            // Don't confirm - leave message for stale recovery
+          }
 
         } else if (message.type === 'summarize') {
           // CRITICAL: Check memorySessionId BEFORE making expensive LLM call
@@ -224,28 +226,30 @@ export class OpenRouterAgent {
           session.conversationHistory.push({ role: 'user', content: summaryPrompt });
           const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
 
-          let tokensUsed = 0;
           if (summaryResponse.content) {
-            // Add response to conversation history
-            // session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
-
-            tokensUsed = summaryResponse.tokensUsed || 0;
+            const tokensUsed = summaryResponse.tokensUsed || 0;
             session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
             session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-          }
 
-          // Process response using shared ResponseProcessor
-          await processAgentResponse(
-            summaryResponse.content || '',
-            session,
-            this.dbManager,
-            this.sessionManager,
-            worker,
-            tokensUsed,
-            originalTimestamp,
-            'OpenRouter',
-            lastCwd
-          );
+            // Process response using shared ResponseProcessor
+            await processAgentResponse(
+              summaryResponse.content,
+              session,
+              this.dbManager,
+              this.sessionManager,
+              worker,
+              tokensUsed,
+              originalTimestamp,
+              'OpenRouter',
+              lastCwd
+            );
+          } else {
+            logger.warn('SDK', 'Empty OpenRouter summary response, skipping processing to preserve message', {
+              sessionId: session.sessionDbId,
+              messageId: session.processingMessageIds[session.processingMessageIds.length - 1]
+            });
+            // Don't confirm - leave message for stale recovery
+          }
         }
       }
 
