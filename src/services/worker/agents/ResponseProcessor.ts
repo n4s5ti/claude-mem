@@ -242,9 +242,9 @@ async function syncAndBroadcastObservations(
   // This runs per-observation batch to ensure folders are updated as work happens
   // Only runs if CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED is true (default: false)
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-  // Handle both string 'true' and boolean true from JSON settings
+  // Settings are normalized to strings by SettingsDefaultsManager.
   const settingValue = settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED;
-  const folderClaudeMdEnabled = settingValue === 'true' || settingValue === true;
+  const folderClaudeMdEnabled = settingValue === 'true';
 
   if (folderClaudeMdEnabled) {
     const allFilePaths: string[] = [];

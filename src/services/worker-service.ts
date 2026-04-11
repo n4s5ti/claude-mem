@@ -107,13 +107,16 @@ import { SessionManager } from './worker/SessionManager.js';
 import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { SDKAgent } from './worker/SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from './worker/GeminiAgent.js';
-import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterAgent.js';
+import { OpenAICompatAgent, createOpenRouterAgent, createGroqAgent, isOpenRouterSelected, isOpenRouterAvailable, isGroqSelected, isGroqAvailable, createCCProxyOpenRouterAgent, createCCProxyGroqAgent, isCCProxyOpenRouterSelected, isCCProxyOpenRouterAvailable, isCCProxyGroqSelected, isCCProxyGroqAvailable } from './worker/OpenAICompatAgent.js';
+import { MiniMaxAgent, isMiniMaxSelected, isMiniMaxAvailable } from './worker/MiniMaxAgent.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
 import { SearchManager } from './worker/SearchManager.js';
 import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
+import type { FallbackAgent, WorkerRef } from './worker/agents/index.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
+import type { ActiveSession } from './worker-types.js';
 
 // HTTP route handlers
 import { ViewerRoutes } from './worker/http/routes/ViewerRoutes.js';
@@ -164,10 +167,14 @@ export class WorkerService {
   // Service layer
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
-  private sseBroadcaster: SSEBroadcaster;
+  public sseBroadcaster: SSEBroadcaster;
   private sdkAgent: SDKAgent;
   private geminiAgent: GeminiAgent;
-  private openRouterAgent: OpenRouterAgent;
+  private openRouterAgent: OpenAICompatAgent;
+  private groqAgent: OpenAICompatAgent;
+  private ccproxyOpenRouterAgent: OpenAICompatAgent;
+  private ccproxyGroqAgent: OpenAICompatAgent;
+  private minimaxAgent: MiniMaxAgent;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
@@ -208,7 +215,24 @@ export class WorkerService {
     this.sseBroadcaster = new SSEBroadcaster();
     this.sdkAgent = new SDKAgent(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
-    this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
+    this.openRouterAgent = createOpenRouterAgent(this.dbManager, this.sessionManager);
+    this.groqAgent = createGroqAgent(this.dbManager, this.sessionManager);
+    this.ccproxyOpenRouterAgent = createCCProxyOpenRouterAgent(this.dbManager, this.sessionManager);
+    this.ccproxyGroqAgent = createCCProxyGroqAgent(this.dbManager, this.sessionManager);
+    this.minimaxAgent = new MiniMaxAgent(this.dbManager, this.sessionManager);
+
+    // Keep provider failover on the free-model path only: Groq <-> OpenRouter.
+    const providerFallback: FallbackAgent = {
+      startSession: async (session: ActiveSession, worker?: WorkerRef) => {
+        await this.runProviderFallback(session, worker);
+      }
+    };
+    this.openRouterAgent.setFallbackAgent(providerFallback);
+    this.geminiAgent.setFallbackAgent(providerFallback);
+    this.groqAgent.setFallbackAgent(providerFallback);
+    this.ccproxyOpenRouterAgent.setFallbackAgent(providerFallback);
+    this.ccproxyGroqAgent.setFallbackAgent(providerFallback);
+    this.minimaxAgent.setFallbackAgent(providerFallback);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -236,7 +260,8 @@ export class WorkerService {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isGroqSelected() && isGroqAvailable()) provider = 'groq';
+        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
         return {
           provider,
@@ -337,7 +362,7 @@ export class WorkerService {
 
     // Standard routes (registered AFTER guard middleware)
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this));
+    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.groqAgent, this.sessionEventBroadcaster, this, this.ccproxyOpenRouterAgent, this.ccproxyGroqAgent, this.minimaxAgent));
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -446,10 +471,13 @@ export class WorkerService {
 
       // Connect to MCP server
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
+      const childEnv = Object.fromEntries(
+        Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)
+      );
       const transport = new StdioClientTransport({
         command: 'node',
         args: [mcpServerPath],
-        env: process.env
+        env: childEnv
       });
 
       const MCP_INIT_TIMEOUT_MS = 300000;
@@ -470,7 +498,7 @@ export class WorkerService {
         }
         return activeIds;
       });
-      logger.info('SYSTEM', 'Started orphan reaper (runs every 5 minutes)');
+      logger.info('SYSTEM', 'Started orphan reaper (runs every 1 minute)');
 
       // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
       this.staleSessionReaperInterval = setInterval(async () => {
@@ -506,19 +534,114 @@ export class WorkerService {
    * Get the appropriate agent based on provider settings.
    * Same logic as SessionRoutes.getActiveAgent() for consistency.
    */
-  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent {
+  private getActiveAgent(): SDKAgent | GeminiAgent | OpenAICompatAgent | MiniMaxAgent {
+    return this.getAgentForProvider(this.getActiveProvider());
+  }
+
+  private getActiveProvider(): NonNullable<ActiveSession['currentProvider']> {
+    if (isCCProxyOpenRouterSelected() && isCCProxyOpenRouterAvailable()) {
+      return 'ccproxy-openrouter';
+    }
+    if (isCCProxyGroqSelected() && isCCProxyGroqAvailable()) {
+      return 'ccproxy-groq';
+    }
+    if (isMiniMaxSelected() && isMiniMaxAvailable()) {
+      return 'minimax';
+    }
+    if (isGroqSelected() && isGroqAvailable()) {
+      return 'groq';
+    }
     if (isOpenRouterSelected() && isOpenRouterAvailable()) {
-      return this.openRouterAgent;
+      return 'openrouter';
     }
     if (isGeminiSelected() && isGeminiAvailable()) {
-      return this.geminiAgent;
+      return 'gemini';
     }
-    return this.sdkAgent;
+    return 'claude';
+  }
+
+  private getAgentForProvider(provider: NonNullable<ActiveSession['currentProvider']>): SDKAgent | GeminiAgent | OpenAICompatAgent | MiniMaxAgent {
+    switch (provider) {
+      case 'ccproxy-openrouter':
+        return this.ccproxyOpenRouterAgent;
+      case 'ccproxy-groq':
+        return this.ccproxyGroqAgent;
+      case 'minimax':
+        return this.minimaxAgent;
+      case 'groq':
+        return this.groqAgent;
+      case 'openrouter':
+        return this.openRouterAgent;
+      case 'gemini':
+        return this.geminiAgent;
+      case 'claude':
+      default:
+        return this.sdkAgent;
+    }
+  }
+
+  private async runProviderFallback(session: ActiveSession, worker?: WorkerRef): Promise<void> {
+    const isRootFailover = !session.providerFailoverTried || session.providerFailoverTried.length === 0;
+    const triedProviders = new Set(session.providerFailoverTried ?? []);
+
+    if (session.currentProvider) {
+      triedProviders.add(session.currentProvider);
+    }
+
+    const backupProviders = (['ccproxy-openrouter', 'ccproxy-groq', 'minimax'] as const).filter((provider) => {
+      if (triedProviders.has(provider)) {
+        return false;
+      }
+      switch (provider) {
+        case 'ccproxy-openrouter': return isCCProxyOpenRouterAvailable();
+        case 'ccproxy-groq': return isCCProxyGroqAvailable();
+        case 'minimax': return isMiniMaxAvailable();
+        default: return false;
+      }
+    });
+
+    if (backupProviders.length === 0) {
+      const fromProvider = session.currentProvider ?? 'unknown';
+      throw new Error(`No CCProxy backup provider available after ${fromProvider} failure`);
+    }
+
+    let lastError: unknown;
+
+    try {
+      for (const provider of backupProviders) {
+        session.providerFailoverTried = [...triedProviders, provider];
+        session.currentProvider = provider;
+
+        logger.warn('SDK', `Trying ${provider} backup provider`, {
+          sessionDbId: session.sessionDbId,
+          triedProviders: session.providerFailoverTried
+        });
+
+        try {
+          await this.getAgentForProvider(provider).startSession(session, worker);
+          return;
+        } catch (error) {
+          lastError = error;
+          logger.warn('SDK', `${provider} backup provider failed`, {
+            sessionDbId: session.sessionDbId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+    } finally {
+      if (isRootFailover) {
+        session.providerFailoverTried = [];
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error('No CCProxy backup provider succeeded');
   }
 
   /**
    * Start a session processor
-   * On SDK resume failure (terminated session), falls back to Gemini/OpenRouter if available,
+   * On SDK resume failure (terminated session), falls back to Groq/OpenRouter if available,
    * otherwise marks messages abandoned and removes session so queue does not grow unbounded.
    */
   private startSessionProcessor(
@@ -529,7 +652,9 @@ export class WorkerService {
 
     const sid = session.sessionDbId;
     const agent = this.getActiveAgent();
-    const providerName = agent.constructor.name;
+    const providerName = this.getActiveProvider();
+    session.currentProvider = providerName;
+    session.providerFailoverTried = [];
 
     // Before starting generator, check if AbortController is already aborted
     // This can happen after a previous generator was aborted but the session still has pending work
@@ -561,13 +686,14 @@ export class WorkerService {
           'ENOENT',
           'spawn',
           'Invalid API key',
+          'FOREIGN KEY constraint failed',
         ];
         if (unrecoverablePatterns.some(pattern => errorMessage.includes(pattern))) {
           hadUnrecoverableError = true;
           this.lastAiInteraction = {
             timestamp: Date.now(),
             success: false,
-            provider: providerName,
+            provider: session.currentProvider ?? providerName,
             error: errorMessage,
           };
           logger.error('SDK', 'Unrecoverable generator error - will NOT restart', {
@@ -604,13 +730,13 @@ export class WorkerService {
         logger.error('SDK', 'Session generator failed', {
           sessionId: session.sessionDbId,
           project: session.project,
-          provider: providerName
+          provider: session.currentProvider ?? providerName
         }, error as Error);
         sessionFailed = true;
         this.lastAiInteraction = {
           timestamp: Date.now(),
           success: false,
-          provider: providerName,
+          provider: session.currentProvider ?? providerName,
           error: errorMessage,
         };
         throw error;
@@ -618,7 +744,7 @@ export class WorkerService {
       .finally(async () => {
         // CRITICAL: Verify subprocess exit to prevent zombie accumulation (Issue #1168)
         const trackedProcess = getProcessBySession(session.sessionDbId);
-        if (trackedProcess && !trackedProcess.process.killed && trackedProcess.process.exitCode === null) {
+        if (trackedProcess && trackedProcess.process.exitCode === null) {
           await ensureProcessExit(trackedProcess, 5000);
         }
 
@@ -629,7 +755,7 @@ export class WorkerService {
           this.lastAiInteraction = {
             timestamp: Date.now(),
             success: true,
-            provider: providerName,
+            provider: session.currentProvider ?? providerName,
           };
         }
 
@@ -659,16 +785,35 @@ export class WorkerService {
 
         // Check if there's pending work that needs processing with a fresh AbortController
         const pendingCount = pendingStore.getPendingCount(session.sessionDbId);
+        const MAX_PENDING_RESTARTS = 3;
 
         if (pendingCount > 0) {
+          // Track consecutive pending-work restarts to prevent infinite loops (e.g. FK errors)
+          session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
+
+          if (session.consecutiveRestarts > MAX_PENDING_RESTARTS) {
+            logger.error('SYSTEM', 'Exceeded max pending-work restarts, stopping to prevent infinite loop', {
+              sessionId: session.sessionDbId,
+              pendingCount,
+              consecutiveRestarts: session.consecutiveRestarts
+            });
+            session.consecutiveRestarts = 0;
+            this.broadcastProcessingStatus();
+            return;
+          }
+
           logger.info('SYSTEM', 'Pending work remains after generator exit, restarting with fresh AbortController', {
             sessionId: session.sessionDbId,
-            pendingCount
+            pendingCount,
+            attempt: session.consecutiveRestarts
           });
           // Reset AbortController for restart
           session.abortController = new AbortController();
           // Restart processor
           this.startSessionProcessor(session, 'pending-work-restart');
+        } else {
+          // Successful completion with no pending work — reset counter
+          session.consecutiveRestarts = 0;
         }
 
         this.broadcastProcessingStatus();
@@ -692,9 +837,9 @@ export class WorkerService {
   }
 
   /**
-   * When SDK resume fails due to terminated session: try Gemini then OpenRouter to drain
-   * pending messages; if no fallback available, mark messages abandoned and remove session.
-   */
+    * When SDK resume fails due to terminated session: try Groq/OpenRouter to drain
+    * pending messages; if no fallback available, mark messages abandoned and remove session.
+    */
   private async runFallbackForTerminatedSession(
     session: ReturnType<typeof this.sessionManager.getSession>,
     _originalError: unknown
@@ -710,28 +855,17 @@ export class WorkerService {
       this.dbManager.getSessionStore().updateMemorySessionId(sessionDbId, syntheticId);
     }
 
-    if (isGeminiAvailable()) {
-      try {
-        await this.geminiAgent.startSession(session, this);
-        return;
-      } catch (e) {
-        logger.warn('SDK', 'Fallback Gemini failed, trying OpenRouter', {
-          sessionId: sessionDbId,
-          error: e instanceof Error ? e.message : String(e)
-        });
-      }
-    }
+    session.currentProvider = 'claude';
+    session.providerFailoverTried = [];
 
-    if (isOpenRouterAvailable()) {
-      try {
-        await this.openRouterAgent.startSession(session, this);
-        return;
-      } catch (e) {
-        logger.warn('SDK', 'Fallback OpenRouter failed', {
-          sessionId: sessionDbId,
-          error: e instanceof Error ? e.message : String(e)
-        });
-      }
+    try {
+      await this.runProviderFallback(session, this);
+      return;
+    } catch (e) {
+      logger.warn('SDK', 'Groq/OpenRouter fallback failed for terminated Claude session', {
+        sessionId: sessionDbId,
+        error: e instanceof Error ? e.message : String(e)
+      });
     }
 
     // No fallback or both failed: mark messages abandoned and remove session so queue doesn't grow
@@ -1005,7 +1139,9 @@ async function main() {
   // Early exit if plugin is disabled in Claude Code settings (#781).
   // Only gate hook-initiated commands; CLI management (stop/status) still works.
   const hookInitiatedCommands = ['start', 'hook', 'restart', '--daemon'];
-  if ((hookInitiatedCommands.includes(command) || command === undefined) && isPluginDisabledInClaudeSettings()) {
+  const sourceManagedRoot = process.env.CLAUDE_MEM_PLUGIN_ROOT;
+  const shouldHonorPluginDisable = !sourceManagedRoot;
+  if (shouldHonorPluginDisable && (hookInitiatedCommands.includes(command) || command === undefined) && isPluginDisabledInClaudeSettings()) {
     process.exit(0);
   }
 

@@ -30,7 +30,9 @@ import {
 
 // Gemini API endpoint — use v1 (stable), not v1beta.
 // v1beta does not support newer models like gemini-3-flash.
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1/models';
+// Override via GEMINI_API_BASE env var (e.g. http://127.0.0.1:4000 for CCProxy).
+// See atl5s LLM routing standard: all providers funnel through CCProxy :4000.
+const GEMINI_API_URL = process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com/v1/models';
 
 // Gemini model types (available via API)
 export type GeminiModel =
@@ -117,7 +119,7 @@ export class GeminiAgent {
   }
 
   /**
-   * Set the fallback agent (Claude SDK) for when Gemini API fails
+   * Set the backup agent for when Gemini API fails
    * Must be set after construction to avoid circular dependency
    */
   setFallbackAgent(agent: FallbackAgent): void {
@@ -324,15 +326,15 @@ export class GeminiAgent {
         throw error;
       }
 
-      // Check if we should fall back to Claude
+      // Check if we should fail over to a backup provider
       if (shouldFallbackToClaude(error) && this.fallbackAgent) {
-        logger.warn('SDK', 'Gemini API failed, falling back to Claude SDK', {
+        logger.warn('SDK', 'Gemini API failed, falling back to backup provider', {
           sessionDbId: session.sessionDbId,
           error: error instanceof Error ? error.message : String(error),
           historyLength: session.conversationHistory.length
         });
 
-        // Fall back to Claude - it will use the same session with shared conversationHistory
+        // Reuse the same session and conversation history during provider failover.
         // Note: With claim-and-delete queue pattern, messages are already deleted on claim
         return this.fallbackAgent.startSession(session, worker);
       }

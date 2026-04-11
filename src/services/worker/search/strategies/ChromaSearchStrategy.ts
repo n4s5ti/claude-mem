@@ -101,27 +101,37 @@ export class ChromaSearchStrategy extends BaseSearchStrategy implements SearchSt
         searchSessions,
         searchPrompts
       });
+      const sqliteOrderBy = orderBy === 'date_asc' ? 'date_asc' : 'date_desc';
 
       // Step 4: Hydrate from SQLite with additional filters
       if (categorized.obsIds.length > 0) {
-        const obsOptions = { type: obsType, concepts, files, orderBy, limit, project };
+        const obsOptions = { type: obsType, concepts, files, orderBy: sqliteOrderBy, limit, project };
         observations = this.sessionStore.getObservationsByIds(categorized.obsIds, obsOptions);
+        if (orderBy === 'relevance') {
+          observations.sort((a, b) => categorized.obsIds.indexOf(a.id) - categorized.obsIds.indexOf(b.id));
+        }
       }
 
       if (categorized.sessionIds.length > 0) {
         sessions = this.sessionStore.getSessionSummariesByIds(categorized.sessionIds, {
-          orderBy,
+          orderBy: sqliteOrderBy,
           limit,
           project
         });
+        if (orderBy === 'relevance') {
+          sessions.sort((a, b) => categorized.sessionIds.indexOf(a.id) - categorized.sessionIds.indexOf(b.id));
+        }
       }
 
       if (categorized.promptIds.length > 0) {
         prompts = this.sessionStore.getUserPromptsByIds(categorized.promptIds, {
-          orderBy,
+          orderBy: sqliteOrderBy,
           limit,
           project
         });
+        if (orderBy === 'relevance') {
+          prompts.sort((a, b) => categorized.promptIds.indexOf(a.id) - categorized.promptIds.indexOf(b.id));
+        }
       }
 
       logger.debug('SEARCH', 'ChromaSearchStrategy: Hydrated results', {

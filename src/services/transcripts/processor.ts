@@ -10,7 +10,7 @@ import { resolveFieldSpec, resolveFields, matchesRule } from './field-utils.js';
 import { expandHomePath } from './config.js';
 import type { TranscriptSchema, WatchTarget, SchemaEvent } from './types.js';
 
-interface SessionState {
+interface SessionState extends Record<string, unknown> {
   sessionId: string;
   cwd?: string;
   project?: string;

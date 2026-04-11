@@ -6,6 +6,7 @@
  */
 
 import express, { Request, Response } from 'express';
+import { dirname } from 'path';
 import { getWorkerPort } from '../../../../shared/worker-utils.js';
 import { logger } from '../../../../utils/logger.js';
 import { stripMemoryTagsFromJson, stripMemoryTagsFromPrompt } from '../../../../utils/tag-stripping.js';
@@ -13,7 +14,8 @@ import { SessionManager } from '../../SessionManager.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
 import { SDKAgent } from '../../SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from '../../GeminiAgent.js';
-import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from '../../OpenRouterAgent.js';
+import { OpenAICompatAgent, isOpenRouterSelected, isOpenRouterAvailable, isGroqSelected, isGroqAvailable, isCCProxyOpenRouterSelected, isCCProxyOpenRouterAvailable, isCCProxyGroqSelected, isCCProxyGroqAvailable } from '../../OpenAICompatAgent.js';
+import { MiniMaxAgent, isMiniMaxSelected, isMiniMaxAvailable } from '../../MiniMaxAgent.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
@@ -33,9 +35,13 @@ export class SessionRoutes extends BaseRouteHandler {
     private dbManager: DatabaseManager,
     private sdkAgent: SDKAgent,
     private geminiAgent: GeminiAgent,
-    private openRouterAgent: OpenRouterAgent,
+    private openRouterAgent: OpenAICompatAgent,
+    private groqAgent: OpenAICompatAgent,
     private eventBroadcaster: SessionEventBroadcaster,
-    private workerService: WorkerService
+    private workerService: WorkerService,
+    private ccproxyOpenRouterAgent?: OpenAICompatAgent,
+    private ccproxyGroqAgent?: OpenAICompatAgent,
+    private minimaxAgent?: MiniMaxAgent
   ) {
     super();
     this.completionHandler = new SessionCompletionHandler(
@@ -51,7 +57,39 @@ export class SessionRoutes extends BaseRouteHandler {
    * Note: Session linking via contentSessionId allows provider switching mid-session.
    * The conversationHistory on ActiveSession maintains context across providers.
    */
-  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent {
+  private getActiveAgent(): SDKAgent | GeminiAgent | OpenAICompatAgent | MiniMaxAgent {
+    if (isCCProxyOpenRouterSelected()) {
+      if (isCCProxyOpenRouterAvailable() && this.ccproxyOpenRouterAgent) {
+        logger.debug('SESSION', 'Using CCProxy-OpenRouter agent');
+        return this.ccproxyOpenRouterAgent;
+      } else {
+        throw new Error('CCProxy-OpenRouter provider selected but agent not initialized.');
+      }
+    }
+    if (isCCProxyGroqSelected()) {
+      if (isCCProxyGroqAvailable() && this.ccproxyGroqAgent) {
+        logger.debug('SESSION', 'Using CCProxy-Groq agent');
+        return this.ccproxyGroqAgent;
+      } else {
+        throw new Error('CCProxy-Groq provider selected but agent not initialized.');
+      }
+    }
+    if (isMiniMaxSelected()) {
+      if (isMiniMaxAvailable() && this.minimaxAgent) {
+        logger.debug('SESSION', 'Using MiniMax agent');
+        return this.minimaxAgent;
+      } else {
+        throw new Error('MiniMax provider selected but agent not initialized.');
+      }
+    }
+    if (isGroqSelected()) {
+      if (isGroqAvailable()) {
+        logger.debug('SESSION', 'Using Groq agent');
+        return this.groqAgent;
+      } else {
+        throw new Error('Groq provider selected but no API key configured. Set CLAUDE_MEM_GROQ_API_KEY in settings or GROQ_API_KEY environment variable.');
+      }
+    }
     if (isOpenRouterSelected()) {
       if (isOpenRouterAvailable()) {
         logger.debug('SESSION', 'Using OpenRouter agent');
@@ -74,7 +112,19 @@ export class SessionRoutes extends BaseRouteHandler {
   /**
    * Get the currently selected provider name
    */
-  private getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' {
+  private getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' | 'groq' | 'ccproxy-openrouter' | 'ccproxy-groq' | 'minimax' {
+    if (isCCProxyOpenRouterSelected() && isCCProxyOpenRouterAvailable()) {
+      return 'ccproxy-openrouter';
+    }
+    if (isCCProxyGroqSelected() && isCCProxyGroqAvailable()) {
+      return 'ccproxy-groq';
+    }
+    if (isMiniMaxSelected() && isMiniMaxAvailable()) {
+      return 'minimax';
+    }
+    if (isGroqSelected() && isGroqAvailable()) {
+      return 'groq';
+    }
     if (isOpenRouterSelected() && isOpenRouterAvailable()) {
       return 'openrouter';
     }
@@ -149,7 +199,7 @@ export class SessionRoutes extends BaseRouteHandler {
    */
   private startGeneratorWithProvider(
     session: ReturnType<typeof this.sessionManager.getSession>,
-    provider: 'claude' | 'gemini' | 'openrouter',
+    provider: 'claude' | 'gemini' | 'openrouter' | 'groq' | 'ccproxy-openrouter' | 'ccproxy-groq' | 'minimax',
     source: string
   ): void {
     if (!session) return;
@@ -164,8 +214,28 @@ export class SessionRoutes extends BaseRouteHandler {
       session.abortController = new AbortController();
     }
 
-    const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
-    const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
+    const agent = (() => {
+      switch (provider) {
+        case 'ccproxy-openrouter': return this.ccproxyOpenRouterAgent ?? this.openRouterAgent;
+        case 'ccproxy-groq': return this.ccproxyGroqAgent ?? this.groqAgent;
+        case 'minimax': return this.minimaxAgent ?? this.sdkAgent;
+        case 'groq': return this.groqAgent;
+        case 'openrouter': return this.openRouterAgent;
+        case 'gemini': return this.geminiAgent;
+        default: return this.sdkAgent;
+      }
+    })();
+    const agentName = (() => {
+      switch (provider) {
+        case 'ccproxy-openrouter': return 'CCProxy-OpenRouter';
+        case 'ccproxy-groq': return 'CCProxy-Groq';
+        case 'minimax': return 'MiniMax';
+        case 'groq': return 'Groq';
+        case 'openrouter': return 'OpenRouter';
+        case 'gemini': return 'Gemini';
+        default: return 'Claude SDK';
+      }
+    })();
 
     // Use database count for accurate telemetry (in-memory array is always empty due to FK constraint fix)
     const pendingStore = this.sessionManager.getPendingMessageStore();
@@ -356,7 +426,7 @@ export class SessionRoutes extends BaseRouteHandler {
       // Sync user prompt to Chroma
       const chromaStart = Date.now();
       const promptText = latestPrompt.prompt_text;
-      this.dbManager.getChromaSync().syncUserPrompt(
+      this.dbManager.getChromaSync()?.syncUserPrompt(
         latestPrompt.id,
         latestPrompt.memory_session_id,
         latestPrompt.project,
@@ -557,19 +627,44 @@ export class SessionRoutes extends BaseRouteHandler {
         ? stripMemoryTagsFromJson(JSON.stringify(tool_response))
         : '{}';
 
+      const resolvedCwd = (() => {
+        if (typeof cwd === 'string' && cwd.trim().length > 0) return cwd;
+
+        const ti = (tool_input && typeof tool_input === 'object') ? tool_input : undefined;
+        const fromToolInput = [
+          ti?.cwd,
+          ti?.workdir,
+          ti?.working_directory,
+          ti?.workspace_root,
+          ti?.workspaceRoot,
+        ];
+        for (const c of fromToolInput) {
+          if (typeof c === 'string' && c.trim().length > 0) return c;
+        }
+
+        const filePath = ti?.file_path ?? ti?.notebook_path;
+        if (typeof filePath === 'string' && filePath.trim().length > 0) {
+          return dirname(filePath);
+        }
+
+        return '';
+      })();
+
+      if (!resolvedCwd) {
+        logger.warn('SESSION', 'Missing cwd when queueing observation (attempted inference)', {
+          sessionId: sessionDbId,
+          tool_name,
+          toolInputKeys: (tool_input && typeof tool_input === 'object') ? Object.keys(tool_input).slice(0, 12) : []
+        });
+      }
+
       // Queue observation
       this.sessionManager.queueObservation(sessionDbId, {
         tool_name,
         tool_input: cleanedToolInput,
         tool_response: cleanedToolResponse,
         prompt_number: promptNumber,
-        cwd: cwd || (() => {
-          logger.error('SESSION', 'Missing cwd when queueing observation in SessionRoutes', {
-            sessionId: sessionDbId,
-            tool_name
-          });
-          return '';
-        })()
+        cwd: resolvedCwd
       });
 
       // Ensure SDK agent is running

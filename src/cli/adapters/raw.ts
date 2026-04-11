@@ -4,9 +4,10 @@ import type { PlatformAdapter, NormalizedHookInput, HookResult } from '../types.
 export const rawAdapter: PlatformAdapter = {
   normalizeInput(raw) {
     const r = raw as any;
+    const cwd = (typeof r?.cwd === 'string' && r.cwd.trim().length > 0) ? r.cwd : process.cwd();
     return {
       sessionId: r.sessionId ?? r.session_id ?? 'unknown',
-      cwd: r.cwd ?? process.cwd(),
+      cwd,
       prompt: r.prompt,
       toolName: r.toolName ?? r.tool_name,
       toolInput: r.toolInput ?? r.tool_input,

@@ -28,13 +28,52 @@ import {
   type WorkerRef
 } from './agents/index.js';
 
-// OpenRouter API endpoint
-const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+// OpenRouter API endpoint.
+// Override via OPENROUTER_BASE_URL env var (e.g. http://127.0.0.1:4000/openrouter/v1 for CCProxy).
+// See atl5s LLM routing standard: all providers funnel through CCProxy :4000.
+const OPENROUTER_API_URL = process.env.OPENROUTER_BASE_URL
+  ? `${process.env.OPENROUTER_BASE_URL.replace(/\/$/, '')}/chat/completions`
+  : 'https://openrouter.ai/api/v1/chat/completions';
 
 // Context window management constants (defaults, overridable via settings)
 const DEFAULT_MAX_CONTEXT_MESSAGES = 20;  // Maximum messages to keep in conversation history
 const DEFAULT_MAX_ESTIMATED_TOKENS = 100000;  // ~100k tokens max context (safety limit)
 const CHARS_PER_TOKEN_ESTIMATE = 4;  // Conservative estimate: 1 token = 4 chars
+
+/**
+ * Collect all configured OpenRouter API keys in priority order:
+ * 1. Primary key (CLAUDE_MEM_OPENROUTER_API_KEY)
+ * 2. Pooled keys (CLAUDE_MEM_OPENROUTER_API_KEYS, comma-separated)
+ * 3. Environment credential (OPENROUTER_API_KEY)
+ * Deduplicates while preserving order.
+ */
+function getAllOpenRouterApiKeys(settings: ReturnType<typeof SettingsDefaultsManager.loadFromFile>): string[] {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (k: string) => {
+    const trimmed = k.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      keys.push(trimmed);
+    }
+  };
+
+  add(settings.CLAUDE_MEM_OPENROUTER_API_KEY || '');
+
+  (settings.CLAUDE_MEM_OPENROUTER_API_KEYS || '')
+    .split(',')
+    .forEach(k => add(k));
+
+  add(getCredential('OPENROUTER_API_KEY') || '');
+
+  return keys;
+}
+
+/** Return the first available key (used by availability checks). */
+function getOpenRouterApiKey(settings: ReturnType<typeof SettingsDefaultsManager.loadFromFile>): string {
+  return getAllOpenRouterApiKeys(settings)[0] || '';
+}
 
 // OpenAI-compatible message format
 interface OpenAIMessage {
@@ -61,10 +100,22 @@ interface OpenRouterResponse {
   };
 }
 
+class OpenRouterApiError extends Error {
+  public readonly statusCode: number;
+  constructor(statusCode: number, message: string) {
+    super(`OpenRouter API error: ${statusCode} - ${message}`);
+    this.name = 'OpenRouterApiError';
+    this.statusCode = statusCode;
+  }
+}
+
 export class OpenRouterAgent {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
   private fallbackAgent: FallbackAgent | null = null;
+  private _nextKeyIndex: number = 0;
+  private _keyCooldowns: Map<number, number> = new Map();
+  private static readonly COOLDOWN_MS = 60_000;
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
@@ -72,7 +123,7 @@ export class OpenRouterAgent {
   }
 
   /**
-   * Set the fallback agent (Claude SDK) for when OpenRouter API fails
+   * Set the backup agent for when OpenRouter API fails
    * Must be set after construction to avoid circular dependency
    */
   setFallbackAgent(agent: FallbackAgent): void {
@@ -86,9 +137,9 @@ export class OpenRouterAgent {
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     try {
       // Get OpenRouter configuration
-      const { apiKey, model, siteUrl, appName } = this.getOpenRouterConfig();
+      const { apiKeys, model, siteUrl, appName } = this.getOpenRouterConfig();
 
-      if (!apiKey) {
+      if (apiKeys.length === 0) {
         throw new Error('OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
       }
 
@@ -110,11 +161,11 @@ export class OpenRouterAgent {
 
       // Add to conversation history and query OpenRouter with full context
       session.conversationHistory.push({ role: 'user', content: initPrompt });
-      const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+      const initResponse = await this.queryOpenRouterWithRotation(session.conversationHistory, apiKeys, model, siteUrl, appName);
 
       if (initResponse.content) {
         // Add response to conversation history
-        // session.conversationHistory.push({ role: 'assistant', content: initResponse.content });
+        session.conversationHistory.push({ role: 'assistant', content: initResponse.content });
 
         // Track token usage
         const tokensUsed = initResponse.tokensUsed || 0;
@@ -180,12 +231,12 @@ export class OpenRouterAgent {
 
           // Add to conversation history and query OpenRouter with full context
           session.conversationHistory.push({ role: 'user', content: obsPrompt });
-          const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+          const obsResponse = await this.queryOpenRouterWithRotation(session.conversationHistory, apiKeys, model, siteUrl, appName);
 
           let tokensUsed = 0;
           if (obsResponse.content) {
             // Add response to conversation history
-            // session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
+            session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
 
             tokensUsed = obsResponse.tokensUsed || 0;
             session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
@@ -222,12 +273,12 @@ export class OpenRouterAgent {
 
           // Add to conversation history and query OpenRouter with full context
           session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-          const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+          const summaryResponse = await this.queryOpenRouterWithRotation(session.conversationHistory, apiKeys, model, siteUrl, appName);
 
           let tokensUsed = 0;
           if (summaryResponse.content) {
             // Add response to conversation history
-            // session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
+            session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
 
             tokensUsed = summaryResponse.tokensUsed || 0;
             session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
@@ -264,15 +315,15 @@ export class OpenRouterAgent {
         throw error;
       }
 
-      // Check if we should fall back to Claude
+      // Check if we should fail over to a backup provider
       if (shouldFallbackToClaude(error) && this.fallbackAgent) {
-        logger.warn('SDK', 'OpenRouter API failed, falling back to Claude SDK', {
+        logger.warn('SDK', 'OpenRouter API failed, falling back to backup provider', {
           sessionDbId: session.sessionDbId,
           error: error instanceof Error ? error.message : String(error),
           historyLength: session.conversationHistory.length
         });
 
-        // Fall back to Claude - it will use the same session with shared conversationHistory
+        // Reuse the same session and conversation history during provider failover.
         // Note: With claim-and-delete queue pattern, messages are already deleted on claim
         return this.fallbackAgent.startSession(session, worker);
       }
@@ -345,6 +396,89 @@ export class OpenRouterAgent {
   }
 
   /**
+   * Query OpenRouter with round-robin key rotation and cooldown tracking.
+   * Distributes load across keys; on retryable errors (401, 402, 429, 504), advances to next key.
+   * Rate-limited keys (429) are placed in a 60s cooldown to avoid hammering them.
+   */
+  private async queryOpenRouterWithRotation(
+    history: ConversationMessage[],
+    apiKeys: string[],
+    model: string,
+    siteUrl?: string,
+    appName?: string
+  ): Promise<{ content: string; tokensUsed?: number }> {
+    let lastError: Error | null = null;
+    const startIndex = this._nextKeyIndex % apiKeys.length;
+    let attemptsLeft = apiKeys.length;
+
+    for (let attempt = 0; attempt < apiKeys.length; attempt++) {
+      const keyIndex = (startIndex + attempt) % apiKeys.length;
+
+      if (this.isKeyInCooldown(keyIndex)) {
+        logger.debug('SDK', `OpenRouter key ${keyIndex + 1}/${apiKeys.length} in cooldown, skipping`);
+        attemptsLeft--;
+        continue;
+      }
+
+      try {
+        const result = await this.queryOpenRouterMultiTurn(history, apiKeys[keyIndex], model, siteUrl, appName);
+        // Advance to next key for subsequent calls (round-robin)
+        this._nextKeyIndex = (keyIndex + 1) % apiKeys.length;
+        return result;
+      } catch (err) {
+        lastError = err as Error;
+        attemptsLeft--;
+        const statusCode = this.extractHttpStatus(lastError);
+        const isRetryable = statusCode !== null && [401, 402, 429, 504].includes(statusCode);
+
+        if (statusCode === 429) {
+          this.cooldownKey(keyIndex);
+        }
+
+        if (isRetryable && attemptsLeft > 0) {
+          logger.warn('SDK', `OpenRouter key ${keyIndex + 1}/${apiKeys.length} failed (${statusCode}), rotating to next key`);
+          continue;
+        }
+        throw lastError;
+      }
+    }
+
+    // All keys exhausted (likely all in cooldown)
+    if (this._keyCooldowns.size >= apiKeys.length) {
+      logger.warn('SDK', 'All OpenRouter keys in cooldown, clearing cooldowns');
+      this._keyCooldowns.clear();
+    }
+
+    throw lastError || new Error('No OpenRouter API keys available');
+  }
+
+  /** Extract HTTP status code from error (typed or string-based fallback) */
+  private extractHttpStatus(error: Error): number | null {
+    if (error instanceof OpenRouterApiError) {
+      return error.statusCode;
+    }
+    const match = (error.message || '').match(/\b(4\d{2}|5\d{2})\b/);
+    return match ? parseInt(match[1], 10) : null;
+  }
+
+  /** Check if a key is in cooldown (auto-expires) */
+  private isKeyInCooldown(keyIndex: number): boolean {
+    const cooldownUntil = this._keyCooldowns.get(keyIndex);
+    if (!cooldownUntil) return false;
+    if (Date.now() >= cooldownUntil) {
+      this._keyCooldowns.delete(keyIndex);
+      return false;
+    }
+    return true;
+  }
+
+  /** Put a key into cooldown after rate limiting */
+  private cooldownKey(keyIndex: number): void {
+    this._keyCooldowns.set(keyIndex, Date.now() + OpenRouterAgent.COOLDOWN_MS);
+    logger.info('SDK', `OpenRouter key ${keyIndex + 1} placed in ${OpenRouterAgent.COOLDOWN_MS / 1000}s cooldown`);
+  }
+
+  /**
    * Query OpenRouter via REST API with full conversation history (multi-turn)
    * Sends the entire conversation context for coherent responses
    */
@@ -379,20 +513,21 @@ export class OpenRouterAgent {
         model,
         messages,
         temperature: 0.3,  // Lower temperature for structured extraction
-        max_tokens: 4096,
+        max_tokens: parseInt(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_OPENROUTER_MAX_RESPONSE_TOKENS) || 1024,
       }),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+      throw new OpenRouterApiError(response.status, errorText);
     }
 
     const data = await response.json() as OpenRouterResponse;
 
     // Check for API error in response body
     if (data.error) {
-      throw new Error(`OpenRouter API error: ${data.error.code} - ${data.error.message}`);
+      const code = parseInt(data.error.code || '0', 10) || 500;
+      throw new OpenRouterApiError(code, data.error.message || 'Unknown error');
     }
 
     if (!data.choices?.[0]?.message?.content) {
@@ -435,13 +570,14 @@ export class OpenRouterAgent {
    * Get OpenRouter configuration from settings or environment
    * Issue #733: Uses centralized ~/.claude-mem/.env for credentials, not random project .env files
    */
-  private getOpenRouterConfig(): { apiKey: string; model: string; siteUrl?: string; appName?: string } {
+  private getOpenRouterConfig(): { apiKeys: string[]; model: string; siteUrl?: string; appName?: string } {
     const settingsPath = USER_SETTINGS_PATH;
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-    // API key: check settings first, then centralized claude-mem .env (NOT process.env)
+    // API keys: collect all configured keys for rotation on failure
+    // Priority: primary key > pooled keys > env credential
     // This prevents Issue #733 where random project .env files could interfere
-    const apiKey = settings.CLAUDE_MEM_OPENROUTER_API_KEY || getCredential('OPENROUTER_API_KEY') || '';
+    const apiKeys = getAllOpenRouterApiKeys(settings);
 
     // Model: from settings or default
     const model = settings.CLAUDE_MEM_OPENROUTER_MODEL || 'xiaomi/mimo-v2-flash:free';
@@ -450,7 +586,7 @@ export class OpenRouterAgent {
     const siteUrl = settings.CLAUDE_MEM_OPENROUTER_SITE_URL || '';
     const appName = settings.CLAUDE_MEM_OPENROUTER_APP_NAME || 'claude-mem';
 
-    return { apiKey, model, siteUrl, appName };
+    return { apiKeys, model, siteUrl, appName };
   }
 }
 
@@ -461,7 +597,7 @@ export class OpenRouterAgent {
 export function isOpenRouterAvailable(): boolean {
   const settingsPath = USER_SETTINGS_PATH;
   const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-  return !!(settings.CLAUDE_MEM_OPENROUTER_API_KEY || getCredential('OPENROUTER_API_KEY'));
+  return !!getOpenRouterApiKey(settings);
 }
 
 /**

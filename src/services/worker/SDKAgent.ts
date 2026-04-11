@@ -30,10 +30,12 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 export class SDKAgent {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
+  private modelOverride: string | null;
 
-  constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
+  constructor(dbManager: DatabaseManager, sessionManager: SessionManager, modelOverride?: string) {
     this.dbManager = dbManager;
     this.sessionManager = sessionManager;
+    this.modelOverride = modelOverride ?? null;
   }
 
   /**
@@ -102,7 +104,7 @@ export class SDKAgent {
     logger.info('SDK', 'Starting SDK query', {
       sessionDbId: session.sessionDbId,
       contentSessionId: session.contentSessionId,
-      memorySessionId: session.memorySessionId,
+      memorySessionId: session.memorySessionId ?? undefined,
       hasRealMemorySessionId,
       shouldResume,
       resume_parameter: shouldResume ? session.memorySessionId : '(none - fresh start)',
@@ -127,6 +129,7 @@ export class SDKAgent {
     // Use custom spawn to capture PIDs for zombie process cleanup (Issue #737)
     // Use dedicated cwd to isolate observer sessions from user's `claude --resume` list
     ensureDir(OBSERVER_SESSIONS_DIR);
+    const resumeSessionId = shouldResume ? session.memorySessionId ?? undefined : undefined;
     // CRITICAL: Pass isolated env to prevent Issue #733 (API key pollution from project .env files)
     const queryResult = query({
       prompt: messageGenerator,
@@ -136,7 +139,7 @@ export class SDKAgent {
         // instead of polluting user's actual project resume lists
         cwd: OBSERVER_SESSIONS_DIR,
         // Only resume if shouldResume is true (memorySessionId exists, not first prompt, not forceInit)
-        ...(shouldResume && { resume: session.memorySessionId }),
+        ...(resumeSessionId ? { resume: resumeSessionId } : {}),
         disallowedTools,
         abortController: session.abortController,
         pathToClaudeCodeExecutable: claudePath,
@@ -281,7 +284,7 @@ export class SDKAgent {
     } finally {
       // Ensure subprocess is terminated after query completes (or on error)
       const tracked = getProcessBySession(session.sessionDbId);
-      if (tracked && !tracked.process.killed && tracked.process.exitCode === null) {
+      if (tracked && tracked.process.exitCode === null) {
         await ensureProcessExit(tracked, 5000);
       }
     }
@@ -481,6 +484,7 @@ export class SDKAgent {
    * Get model ID from settings or environment
    */
   private getModelId(): string {
+    if (this.modelOverride) return this.modelOverride;
     const settingsPath = path.join(homedir(), '.claude-mem', 'settings.json');
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
     return settings.CLAUDE_MEM_MODEL;

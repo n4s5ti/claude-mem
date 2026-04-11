@@ -11,11 +11,13 @@ import type { PlatformAdapter, NormalizedHookInput, HookResult } from '../types.
 export const cursorAdapter: PlatformAdapter = {
   normalizeInput(raw) {
     const r = (raw ?? {}) as any;
+    const rawCwd = r.workspace_roots?.[0] ?? r.cwd;
+    const cwd = (typeof rawCwd === 'string' && rawCwd.trim().length > 0) ? rawCwd : process.cwd();
     // Cursor-specific: shell commands come as command/output instead of tool_name/input/response
     const isShellCommand = !!r.command && !r.tool_name;
     return {
       sessionId: r.conversation_id || r.generation_id || r.id,
-      cwd: r.workspace_roots?.[0] ?? r.cwd ?? process.cwd(),
+      cwd,
       prompt: r.prompt ?? r.query ?? r.input ?? r.message,
       toolName: isShellCommand ? 'Bash' : r.tool_name,
       toolInput: isShellCommand ? { command: r.command } : r.tool_input,

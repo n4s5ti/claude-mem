@@ -18,17 +18,31 @@ export interface SettingsDefaults {
   CLAUDE_MEM_WORKER_HOST: string;
   CLAUDE_MEM_SKIP_TOOLS: string;
   // AI Provider Configuration
-  CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter'
+  CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter' | 'groq'
   CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  // 'cli' | 'api' - how Claude provider authenticates
   CLAUDE_MEM_GEMINI_API_KEY: string;
   CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: string;  // 'true' | 'false' - enable rate limiting for free tier
   CLAUDE_MEM_OPENROUTER_API_KEY: string;
+  CLAUDE_MEM_OPENROUTER_API_KEYS: string;
   CLAUDE_MEM_OPENROUTER_MODEL: string;
   CLAUDE_MEM_OPENROUTER_SITE_URL: string;
   CLAUDE_MEM_OPENROUTER_APP_NAME: string;
   CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: string;
   CLAUDE_MEM_OPENROUTER_MAX_TOKENS: string;
+  CLAUDE_MEM_OPENROUTER_MAX_RESPONSE_TOKENS: string;
+  // Groq Configuration
+  CLAUDE_MEM_GROQ_API_KEY: string;
+  CLAUDE_MEM_GROQ_API_KEYS: string;
+  CLAUDE_MEM_GROQ_MODEL: string;
+  CLAUDE_MEM_GROQ_MAX_CONTEXT_MESSAGES: string;
+  CLAUDE_MEM_GROQ_MAX_TOKENS: string;
+  CLAUDE_MEM_GROQ_MAX_RESPONSE_TOKENS: string;
+  // MiniMax Configuration (via CCProxy — Anthropic wire format)
+  CLAUDE_MEM_MINIMAX_MODEL: string;
+  CLAUDE_MEM_MINIMAX_MAX_CONTEXT_MESSAGES: string;
+  CLAUDE_MEM_MINIMAX_MAX_TOKENS: string;
+  CLAUDE_MEM_MINIMAX_MAX_RESPONSE_TOKENS: string;
   // System Configuration
   CLAUDE_MEM_DATA_DIR: string;
   CLAUDE_MEM_LOG_LEVEL: string;
@@ -54,6 +68,8 @@ export interface SettingsDefaults {
   // Exclusion Settings
   CLAUDE_MEM_EXCLUDED_PROJECTS: string;  // Comma-separated glob patterns for excluded project paths
   CLAUDE_MEM_FOLDER_MD_EXCLUDE: string;  // JSON array of folder paths to exclude from CLAUDE.md generation
+  // Rate Limiting / Pacing
+  CLAUDE_MEM_PROVIDER_PACE_MS: string;  // Delay between API requests to avoid burst-exhausting rate limits (ms)
   // Chroma Vector Database Configuration
   CLAUDE_MEM_CHROMA_ENABLED: string;   // 'true' | 'false' - set to 'false' for SQLite-only mode
   CLAUDE_MEM_CHROMA_MODE: string;      // 'local' | 'remote'
@@ -83,11 +99,25 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',  // Default Gemini model (highest free tier RPM)
     CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'true',  // Rate limiting ON by default for free tier users
     CLAUDE_MEM_OPENROUTER_API_KEY: '',  // Empty by default, can be set via UI or env
+    CLAUDE_MEM_OPENROUTER_API_KEYS: '',  // Optional comma-separated fallback key pool
     CLAUDE_MEM_OPENROUTER_MODEL: 'xiaomi/mimo-v2-flash:free',  // Default OpenRouter model (free tier)
     CLAUDE_MEM_OPENROUTER_SITE_URL: '',  // Optional: for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_APP_NAME: 'claude-mem',  // App name for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
     CLAUDE_MEM_OPENROUTER_MAX_TOKENS: '100000',  // Max estimated tokens (~100k safety limit)
+    CLAUDE_MEM_OPENROUTER_MAX_RESPONSE_TOKENS: '1024',  // Max response tokens per API call (free tier safe)
+    // Groq Configuration
+    CLAUDE_MEM_GROQ_API_KEY: '',  // Empty by default, loaded via load-groq-keys.sh
+    CLAUDE_MEM_GROQ_API_KEYS: '',  // Optional comma-separated fallback key pool
+    CLAUDE_MEM_GROQ_MODEL: 'openai/gpt-oss-120b',  // Default Groq model
+    CLAUDE_MEM_GROQ_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
+    CLAUDE_MEM_GROQ_MAX_TOKENS: '100000',  // Max estimated tokens
+    CLAUDE_MEM_GROQ_MAX_RESPONSE_TOKENS: '1024',  // Max response tokens per API call
+    // MiniMax Configuration (via CCProxy — Anthropic wire format)
+    CLAUDE_MEM_MINIMAX_MODEL: 'MiniMax-M2.7',
+    CLAUDE_MEM_MINIMAX_MAX_CONTEXT_MESSAGES: '20',   // Max messages in context window
+    CLAUDE_MEM_MINIMAX_MAX_TOKENS: '100000',          // Max estimated tokens (~100k safety limit)
+    CLAUDE_MEM_MINIMAX_MAX_RESPONSE_TOKENS: '1024',  // Max response tokens per API call
     // System Configuration
     CLAUDE_MEM_DATA_DIR: join(homedir(), '.claude-mem'),
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
@@ -113,6 +143,8 @@ export class SettingsDefaultsManager {
     // Exclusion Settings
     CLAUDE_MEM_EXCLUDED_PROJECTS: '',  // Comma-separated glob patterns for excluded project paths
     CLAUDE_MEM_FOLDER_MD_EXCLUDE: '[]',  // JSON array of folder paths to exclude from CLAUDE.md generation
+    // Rate Limiting / Pacing
+    CLAUDE_MEM_PROVIDER_PACE_MS: '2000',  // 2 seconds between API requests (trickle pacing for free-tier rate limits)
     // Chroma Vector Database Configuration
     CLAUDE_MEM_CHROMA_ENABLED: 'true',         // Set to 'false' to disable Chroma and use SQLite-only search
     CLAUDE_MEM_CHROMA_MODE: 'local',           // 'local' uses persistent chroma-mcp via uvx, 'remote' connects to existing server
@@ -133,10 +165,15 @@ export class SettingsDefaultsManager {
   }
 
   /**
-   * Get a default value from defaults (no environment variable override)
+   * Get a setting value with environment variable override.
+   * Priority: process.env > hardcoded default
+   *
+   * For full priority (env > settings file > default), use loadFromFile().
+   * This method is safe to call at module-load time (no file I/O) and still
+   * respects environment variable overrides that were previously ignored.
    */
   static get(key: keyof SettingsDefaults): string {
-    return this.DEFAULTS[key];
+    return process.env[key] ?? this.DEFAULTS[key];
   }
 
   /**
@@ -153,7 +190,7 @@ export class SettingsDefaultsManager {
    */
   static getBool(key: keyof SettingsDefaults): boolean {
     const value = this.get(key);
-    return value === 'true' || value === true;
+    return value === 'true';
   }
 
   /**

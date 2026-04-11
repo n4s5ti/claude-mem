@@ -72,7 +72,7 @@ export interface ExtendedSearchOptions extends SearchOptions {
   /** Type filter for search API (observations, sessions, prompts) */
   searchType?: 'observations' | 'sessions' | 'prompts' | 'all';
   /** Observation type filter (decision, bugfix, feature, etc.) */
-  obsType?: string | string[];
+  obsType?: SearchOptions['type'];
   /** Concept tags to filter by */
   concepts?: string | string[];
   /** File paths to filter by */

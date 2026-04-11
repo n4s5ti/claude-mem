@@ -15,7 +15,9 @@ export enum LogLevel {
   SILENT = 4
 }
 
-export type Component = 'HOOK' | 'WORKER' | 'SDK' | 'PARSER' | 'DB' | 'SYSTEM' | 'HTTP' | 'SESSION' | 'CHROMA' | 'CHROMA_MCP' | 'CHROMA_SYNC' | 'FOLDER_INDEX' | 'CLAUDE_MD' | 'QUEUE';
+// Components grow faster than this package's logger type union. Keep the logger
+// permissive so adding a new subsystem does not break unrelated builds.
+export type Component = string;
 
 interface LogContext {
   sessionId?: number;

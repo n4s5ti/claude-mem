@@ -2,15 +2,15 @@
  * FallbackErrorHandler: Error detection for provider fallback
  *
  * Responsibility:
- * - Determine if an error should trigger fallback to Claude SDK
- * - Provide consistent error classification across Gemini and OpenRouter
+ * - Determine if an error should trigger backup-provider failover
+ * - Provide consistent error classification across non-Claude providers
  */
 
 import { FALLBACK_ERROR_PATTERNS } from './types.js';
 import { logger } from '../../../utils/logger.js';
 
 /**
- * Check if an error should trigger fallback to Claude SDK
+ * Check if an error should trigger backup-provider failover
  *
  * Errors that trigger fallback:
  * - 429: Rate limit exceeded
@@ -20,7 +20,7 @@ import { logger } from '../../../utils/logger.js';
  * - fetch failed: Network failure
  *
  * @param error - Error object to check
- * @returns true if the error should trigger fallback to Claude
+ * @returns true if the error should trigger provider failover
  */
 export function shouldFallbackToClaude(error: unknown): boolean {
   const message = getErrorMessage(error);

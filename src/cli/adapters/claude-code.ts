@@ -5,9 +5,10 @@ import type { PlatformAdapter, NormalizedHookInput, HookResult } from '../types.
 export const claudeCodeAdapter: PlatformAdapter = {
   normalizeInput(raw) {
     const r = (raw ?? {}) as any;
+    const cwd = (typeof r.cwd === 'string' && r.cwd.trim().length > 0) ? r.cwd : process.cwd();
     return {
       sessionId: r.session_id ?? r.id ?? r.sessionId,
-      cwd: r.cwd ?? process.cwd(),
+      cwd,
       prompt: r.prompt,
       toolName: r.tool_name,
       toolInput: r.tool_input,
@@ -16,13 +17,20 @@ export const claudeCodeAdapter: PlatformAdapter = {
     };
   },
   formatOutput(result) {
-    if (result.hookSpecificOutput) {
+    const r = result ?? ({} as HookResult);
+    if (r.hookSpecificOutput) {
       const output: Record<string, unknown> = { hookSpecificOutput: result.hookSpecificOutput };
-      if (result.systemMessage) {
-        output.systemMessage = result.systemMessage;
+      if (r.systemMessage) {
+        output.systemMessage = r.systemMessage;
       }
       return output;
     }
-    return { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
+    // Only emit fields in the Claude Code hook contract — unrecognized fields
+    // cause "JSON validation failed" in Stop hooks.
+    const output: Record<string, unknown> = {};
+    if (r.systemMessage) {
+      output.systemMessage = r.systemMessage;
+    }
+    return output;
   }
 };
